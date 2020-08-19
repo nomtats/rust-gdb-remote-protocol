@@ -258,6 +258,10 @@ enum Command<'a> {
     WriteMemory(MemoryRegion, Vec<u8>),
     Query(Query<'a>),
     Reset,
+    /// Step execution
+    Step,
+    /// Continue execution
+    Continue,
     PingThread(ThreadId),
     CtrlC,
     UnknownVCommand,
@@ -349,7 +353,7 @@ fn query<'a>(i: &'a [u8]) -> IResult<&'a [u8], Query<'a>> {
                       |syscalls| Query::CatchSyscalls(Some(syscalls))
                   }
                   | preceded!(tag!("QPassSignals:"),
-                              separated_nonempty_list_complete!(tag!(";"), hex_value)) => {
+                              separated_list_complete!(tag!(";"), hex_value)) => {
                       |signals| Query::PassSignals(signals)
                   }
                   | preceded!(tag!("QProgramSignals:"),
@@ -621,6 +625,8 @@ fn command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
          | read_register => { |regno| Command::ReadRegister(regno) }
          | write_register => { |(regno, bytes)| Command::WriteRegister(regno, bytes) }
          | query => { |q| Command::Query(q) }
+         | tag!("s") => { |_| Command::Step }
+         | tag!("c") => { |_| Command::Continue }
          | tag!("r") => { |_| Command::Reset }
          | preceded!(tag!("R"), take!(2)) => { |_| Command::Reset }
          | parse_ping_thread => { |thread_id| Command::PingThread(thread_id) }
@@ -719,6 +725,21 @@ pub trait Handler {
     /// processes, or even rebooting an entire bare-metal target,
     /// would be appropriate.
     fn kill(&self, _pid: Option<u64>) -> Result<(), Error> {
+        Err(Error::Unimplemented)
+    }
+
+    /// Step execution.
+    fn step(&mut self) -> Result<StopReason, Error> {
+        Err(Error::Unimplemented)
+    }
+
+    /// Continue execution.
+    fn continue_execution(&mut self) -> Result<(), Error> {
+        Err(Error::Unimplemented)
+    }
+
+    /// Handle interruption.
+    fn interrupt(&mut self) -> Result<StopReason, Error> {
         Err(Error::Unimplemented)
     }
 
@@ -1120,8 +1141,8 @@ fn handle_supported_features<'a, H>(handler: &H, _features: &Vec<GDBFeatureSuppo
 }
 
 /// Handle a single packet `data` with `handler` and write a response to `writer`.
-fn handle_packet<H, W>(data: &[u8],
-                       handler: &H,
+pub fn handle_packet<H, W>(data: &[u8],
+                       handler: &mut H,
                        writer: &mut W) -> io::Result<bool>
     where H: Handler,
           W: Write,
@@ -1151,6 +1172,13 @@ fn handle_packet<H, W>(data: &[u8],
                 handler.kill(pid).into()
             },
             Command::Reset => Response::Empty,
+            Command::Step => {
+                handler.step().into()
+            },
+            Command::Continue => {
+                handler.continue_execution();//.into()
+                Response::Empty
+            }
             Command::ReadRegister(regno) => {
                 handler.read_register(regno).into()
             },
@@ -1212,7 +1240,8 @@ fn handle_packet<H, W>(data: &[u8],
                 handler.catch_syscalls(calls).into()
             }
             Command::Query(Query::PassSignals(signals)) => {
-                handler.set_pass_signals(signals).into()
+                //handler.set_pass_signals(signals).into();
+                Response::Ok
             }
             Command::Query(Query::ProgramSignals(signals)) => {
                 handler.set_program_signals(signals).into()
@@ -1280,11 +1309,46 @@ fn run_parser(buf: &[u8]) -> Option<(usize, Packet)> {
     }
 }
 
+///
+pub fn process_packets<W, H>(buf: &[u8],
+                             writer: &mut W,
+                             handler:&mut H,
+                             ack_mode: &mut bool) -> usize
+    where W: Write,
+          H: Handler
+{
+    if let Some((len, packet)) = run_parser(buf) {
+        match packet {
+            Packet::Data(ref data, ref _checksum) => {
+                // Write an ACK
+                if *ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
+                    //TODO: propagate errors to caller?
+                    return 0;
+                }
+                let no_ack_mode = handle_packet(&data, handler, writer).unwrap_or(false);
+                if no_ack_mode {
+                    *ack_mode = false;
+                }
+            },
+            Packet::Interrupt => {
+                let response = handler.interrupt().into();
+                write_response(response, writer).unwrap();
+            },
+            // Just ignore ACK/NACK/Interrupt
+            _ => {},
+        };
+        len
+    } else {
+        0
+    }
+}
+
+
 /// Read gdbserver packets from `reader` and call methods on `handler` to handle them and write
 /// responses to `writer`.
 pub fn process_packets_from<R, W, H>(reader: R,
                                      mut writer: W,
-                                     handler: H)
+                                     handler:&mut H)
     where R: Read,
           W: Write,
           H: Handler
@@ -1297,26 +1361,7 @@ pub fn process_packets_from<R, W, H>(reader: R,
             if buf.len() == 0 {
                 done = true;
             }
-            if let Some((len, packet)) = run_parser(buf) {
-                match packet {
-                    Packet::Data(ref data, ref _checksum) => {
-                        // Write an ACK
-                        if ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
-                            //TODO: propagate errors to caller?
-                            return;
-                        }
-                        let no_ack_mode = handle_packet(&data, &handler, &mut writer).unwrap_or(false);
-                        if no_ack_mode {
-                            ack_mode = false;
-                        }
-                    },
-                    // Just ignore ACK/NACK/Interrupt
-                    _ => {},
-                };
-                len
-            } else {
-                0
-            }
+            process_packets(&buf, &mut writer, handler, &mut ack_mode)
         } else {
             // Error reading
             done = true;
